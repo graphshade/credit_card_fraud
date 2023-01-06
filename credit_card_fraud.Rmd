@@ -1,0 +1,1018 @@
+---
+title: "Fraud Project"
+author: "Elvis Agbenyega"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+---
+
+
+# Load Libraries 
+
+```{r, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(GGally)
+library(kableExtra) # -- make nice looking resutls when we knitt 
+library(vip)        # --  tidymodels variable importance
+library(fastshap)   # -- shapley values for variable importance 
+library(DataExplorer)
+library(rpart.plot)
+library(ggthemes)
+library(solitude) 
+library(janitor)
+library(DALEX)
+library(DALEXtra)
+```
+
+***
+
+# Data Preparation
+
+## Import Data
+
+```{r}
+
+# - - - - - Import dataset and convert categorical variables - - - - -
+
+fraud_df <- readr::read_csv("./data/project_2_training.csv",
+                            col_types = cols(.default = "?",
+                                      EVENT_ID = col_character(),
+                                      card_bin = col_character(),
+                                      billing_postal = col_character()),
+                            na = c("nan",""," ")) %>%
+  clean_names()
+
+fraud_holdout <- readr::read_csv("./data/project_2_holdout.csv",
+                            col_types = cols(.default = "?",
+                                      EVENT_ID = col_character(),
+                                      card_bin = col_character(),
+                                      billing_postal = col_character()),
+                            na = c("nan",""," ")) %>%
+  clean_names()
+
+head(fraud_df) 
+head(fraud_holdout)
+```
+
+## Profile of training dataset
+```{r}
+fraud_df %>% skim()
+```
+
+
+# Exploratory analysis
+
+## Investigating the fraud rate in the dataset
+
+```{r}
+fraud_summary <- fraud_df %>%
+  count(event_label) %>%
+  mutate(pct = n/sum(n))
+
+fraud_summary
+
+fraud_summary  %>%
+  ggplot(aes(x=event_label,y=pct)) +
+  geom_col()  + 
+  scale_y_continuous(labels = label_percent()) + 
+  geom_text(aes(label = paste(round(100*pct,2), "%", sep = "")) , vjust = 1.5, colour = "white" ) +
+  labs(title="Fraud Rate", x="Fraud", y="PCT")
+```
+
+## Investigate fraud over the years
+```{r}
+fraud_df %>% na.omit() %>%
+  mutate(period = lubridate::year(event_timestamp)) %>% 
+  group_by(period, event_label) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = round(n/sum(n) *100,0))
+
+```
+
+
+
+## Investigating whether email_domain is related to fraud
+
+```{r}
+fraud_df  %>% 
+count(event_label, email_domain) %>% 
+pivot_wider(id_cols = email_domain, values_from = n, values_fill = 0, names_from = event_label) %>% 
+mutate(pct_fraud = fraud/(fraud+legit)) %>% 
+filter(pct_fraud >= 0.20 & (fraud+legit) >= 10 ) %>% 
+arrange(desc(pct_fraud))
+  
+```
+
+## Investigating whether pilling postal is related to fraud
+
+```{r}
+fraud_df  %>% 
+count(event_label, billing_postal) %>% 
+pivot_wider(id_cols = billing_postal, values_from = n, values_fill = 0, names_from = event_label) %>% 
+mutate(pct_fraud = fraud/(fraud+legit)) %>% 
+filter(pct_fraud >= 0.20 & (fraud+legit) >= 10 ) %>% 
+arrange(desc(pct_fraud))
+  
+```
+
+## Investigating whether transaction currency is related to fraud
+
+```{r}
+fraud_df  %>% 
+  ggplot(., aes(currency)) + 
+  geom_bar(aes(fill = event_label), position = "fill") +
+  scale_fill_grey(start = 0.6, end = 0.2) + 
+  labs(title = "Currency",
+       y = "proportion",
+       x="")
+  
+```
+## Investigating numerical variables
+```{r, warning=FALSE}
+fraud_df %>%
+ select_if(is.numeric) %>% names() -> num_cols
+
+fraud_df[,append(num_cols,"event_label")] %>% 
+  plot_boxplot(by="event_label", ncol=2L,ggtheme = ggthemes::theme_clean())
+```
+
+
+# Feature engineering and feature selection
+
+## Data preparation
+
+```{r}
+#convert characters to factors and create additional features for exploration
+fraud_prep <- fraud_df %>% mutate(
+  event_label = as.factor(event_label),
+  maj_industry_id = substr(card_bin, 1,1), #add major industry of credit card as additional feature
+  uid = stringr::str_c(maj_industry_id ,transaction_type, currency, sep="_"), #create additional feature for exploratory
+  currency = as.factor(currency),
+  cvv = as.factor(cvv),
+  transaction_type = as.factor(transaction_type),
+  transaction_env = as.factor(transaction_env),
+  event_timestamp_month = as.character(lubridate::month(event_timestamp, label = TRUE)),
+  event_timestamp_day = as.character(lubridate::day(event_timestamp)),
+  m_d = stringr::str_c(event_timestamp_month ,event_timestamp_day, sep="_"),
+  trans_amt_trans_adj = transaction_amt/transaction_adj_amt
+)
+
+#convert characters to factors for the holding dataset
+fraud_holdout <- fraud_holdout %>% mutate(
+  maj_industry_id = substr(card_bin, 1,1),
+  uid = stringr::str_c(maj_industry_id ,transaction_type, currency, sep="_"),
+  currency = as.factor(currency),
+  cvv = as.factor(cvv),
+  event_timestamp_month = as.character(lubridate::month(event_timestamp, label = TRUE)),
+  event_timestamp_day = as.character(lubridate::day(event_timestamp)),
+  m_d = stringr::str_c(event_timestamp_month ,event_timestamp_day, sep="_")
+)
+
+```
+
+
+## 70/30 Stratified train-test split
+
+```{r}
+# -- set a random seed for repeatablity 
+set.seed(321)
+
+# -- performs stratified our train / test split 
+fraud_split <- initial_split(fraud_prep, prop = 0.7, strata = event_label)
+
+# -- extract the training data 
+fraud_train<- training(fraud_split)
+# -- extract the test data 
+fraud_test <- testing(fraud_split)
+
+sprintf("Train PCT : %1.2f%%", nrow(fraud_train)/ nrow(fraud_prep) * 100)
+
+# training set proportions by class
+fraud_train %>%
+  group_by(event_label) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = n/sum(n))
+
+sprintf("Test  PCT : %1.2f%%", nrow(fraud_test)/ nrow(fraud_prep) * 100)
+
+# test set proportions by class
+fraud_test %>%
+  group_by(event_label) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = n/sum(n))
+```
+
+
+## Additional Features to explore
+```{r}
+
+#function for target encoding
+target_enconder <- function(train_df, output_df, var, rate=0.0, count = 0){
+  new_name = paste0(var,"_fprob")
+  result <- train_df  %>% 
+  count(event_label, .data[[var]]) %>% 
+  pivot_wider(id_cols = .data[[var]], values_from = n, values_fill = 0, names_from = event_label) %>% 
+  mutate(!!enquo(new_name) := fraud/(fraud+legit)) %>% 
+  filter(.data[[new_name]] >= rate & (fraud+legit) >= count ) %>% 
+  dplyr::select(.data[[var]], .data[[new_name]])
+  
+  return(
+    result %>% 
+  right_join(output_df, by = var) %>% 
+  mutate(!!enquo(new_name) := replace_na(.data[[new_name]],0))
+  )}
+
+#- - - card_bin
+fraud_train <- target_enconder(fraud_train, fraud_train, "card_bin", rate=0.10, count=10)
+fraud_test <- target_enconder(fraud_train, fraud_test, "card_bin", rate=0.10, count=10)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "card_bin", rate=0.10, count=10)
+
+# - - - email_domain
+fraud_train <- target_enconder(fraud_train, fraud_train, "email_domain", rate=0.10, count=10)
+fraud_test <- target_enconder(fraud_train, fraud_test, "email_domain", rate=0.10, count=10)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "email_domain", rate=0.10, count=10)
+
+# - - - billing_postal
+fraud_train <- target_enconder(fraud_train, fraud_train, "billing_postal", rate=0.2, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "billing_postal", rate=0.2, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "billing_postal", rate=0.2, count=0)
+
+# - - - transaction_type
+fraud_train <- target_enconder(fraud_train, fraud_train, "transaction_type", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "transaction_type", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "transaction_type", rate=0.0, count=0)
+
+# - - - maj_industry_id
+fraud_train <- target_enconder(fraud_train, fraud_train, "maj_industry_id", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "maj_industry_id", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "maj_industry_id", rate=0.0, count=0)
+
+# - - - cvv
+fraud_train <- target_enconder(fraud_train, fraud_train, "cvv", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "cvv", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout,"cvv", rate=0.0, count=0)
+
+# - - - signature_image
+fraud_train <- target_enconder(fraud_train, fraud_train, "signature_image", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "signature_image", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "signature_image", rate=0.0, count=0)
+
+# - - - transaction_env
+fraud_train <- target_enconder(fraud_train, fraud_train, "transaction_env", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test,  "transaction_env", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout,  "transaction_env", rate=0.0, count=0)
+
+# - - - uid
+fraud_train <- target_enconder(fraud_train, fraud_train, "uid", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "uid", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "uid", rate=0.0, count=0)
+
+# - - - month_day
+fraud_train <- target_enconder(fraud_train, fraud_train, "m_d", rate=0.0, count=0)
+fraud_test <- target_enconder(fraud_train, fraud_test, "m_d", rate=0.0, count=0)
+fraud_holdout <- target_enconder(fraud_train, fraud_holdout, "m_d", rate=0.0, count=0)
+
+
+# - - - transactiontype_group_mean
+trans_type_trans_adj_mean <- fraud_train %>% 
+  group_by(transaction_type) %>% 
+  summarise(transaction_adj_amt_trans_type_mean = mean(transaction_adj_amt, na.rm = T),
+            transaction_adj_amt_trans_type_std = sd(transaction_adj_amt, na.rm = T)) %>% 
+  dplyr::select(transaction_type, transaction_adj_amt_trans_type_mean,transaction_adj_amt_trans_type_std)
+
+fraud_train <- trans_type_trans_adj_mean  %>% 
+  right_join(fraud_train, by = "transaction_type") %>% 
+   mutate(transaction_adj_amt_trans_type_mean = replace_na(transaction_adj_amt_trans_type_mean,0),
+          transaction_adj_amt_trans_type_std = replace_na(transaction_adj_amt_trans_type_std,0))
+
+fraud_test <- trans_type_trans_adj_mean %>% 
+  right_join(fraud_test, by = "transaction_type") %>% 
+   mutate(transaction_adj_amt_trans_type_mean = replace_na(transaction_adj_amt_trans_type_mean,0),
+          transaction_adj_amt_trans_type_std = replace_na(transaction_adj_amt_trans_type_std,0))
+
+fraud_holdout <- trans_type_trans_adj_mean  %>% 
+  right_join(fraud_holdout, by = "transaction_type") %>% 
+   mutate(transaction_adj_amt_trans_type_mean = replace_na(transaction_adj_amt_trans_type_mean,0),
+          transaction_adj_amt_trans_type_std = replace_na(transaction_adj_amt_trans_type_std,0))
+
+# - - - transactiontype_account_days_group_mean
+trans_type_account_days_mean <- fraud_train %>% 
+  group_by(transaction_type) %>% 
+  summarise(account_age_days_trans_type_mean = mean(account_age_days, na.rm = T),
+            account_age_days_trans_type_std = sd(account_age_days, na.rm = T)) %>% 
+  dplyr::select(transaction_type, account_age_days_trans_type_mean,account_age_days_trans_type_std)
+
+fraud_train <- trans_type_account_days_mean  %>% 
+  right_join(fraud_train, by = "transaction_type") %>% 
+   mutate(account_age_days_trans_type_mean = replace_na(account_age_days_trans_type_mean,0),
+          account_age_days_trans_type_std = replace_na(account_age_days_trans_type_std,0))
+
+fraud_test <- trans_type_account_days_mean %>% 
+  right_join(fraud_test, by = "transaction_type")
+
+fraud_holdout <- trans_type_account_days_mean  %>% 
+  right_join(fraud_holdout, by = "transaction_type")
+
+# - - - card_bin - frequency
+card_bin_freq <- fraud_train %>% 
+  group_by(card_bin) %>% summarise(card_bin_freq = n()) %>% 
+  dplyr::select(card_bin, card_bin_freq)
+
+fraud_train <- card_bin_freq %>% 
+  right_join(fraud_train, by = "card_bin")
+
+fraud_test <- card_bin_freq %>% 
+  right_join(fraud_test, by = "card_bin")
+
+fraud_holdout <- card_bin_freq %>% 
+  right_join(fraud_holdout, by = "card_bin")
+
+```
+
+
+## Feature Selection
+
+```{r, eval=FALSE}
+
+# Vector of features not to explore
+chr_col_deselect <- c("event_id","ip_address","user_agent","user_agent_browser","email_domain","phone_number","billing_city",
+                      "billing_postal", "billing_state","card_bin" ,"signature_image","transaction_type","transaction_env",
+                      "applicant_name","billing_address","merchant_id","locale","tranaction_initiate", "maj_industry_id",
+                      "event_timestamp_month","event_timestamp_wday","event_timestamp_hour","event_timestamp_day", "event_timestamp")
+
+# Function to fit logistic regression for each feature to test its significance
+feature_selector <- function(data){
+  data <- data %>% dplyr::select(-one_of(chr_col_deselect))
+  predictor_set <- data %>% dplyr::select(-one_of(append("event_label",chr_col_deselect))) %>% names()
+  
+  n= 1
+  for(predictor in predictor_set){
+    print(n)
+    print(predictor)
+    n = n+1
+    df_ <- data[,append(predictor,"event_label")]
+    print(names(df_))
+    
+    #recipe
+    fraud_recipe <- recipe(event_label ~., data = df_) %>%
+      step_impute_median(all_numeric_predictors()) %>%
+      step_unknown(all_nominal_predictors()) %>%
+      step_dummy(all_nominal_predictors())
+
+
+    #Model specification
+    log_spec <- logistic_reg() %>%
+      set_mode("classification") %>%
+      set_engine("glm")
+    
+    tryCatch(
+      expr = {
+    #Model workflow
+    log_workflow <- workflow() %>%
+      add_recipe(fraud_recipe) %>%
+      add_model(log_spec) %>%
+      fit(df_)
+
+
+    ## -- check out your parameter estimates ...
+    metrics <- tidy(log_workflow) %>%
+      mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+
+    print(metrics)},
+    error = function(e){
+      print(e)
+    },
+    warning = function(w){
+      print(w)
+    })
+  }}
+
+
+
+```
+
+```{r, eval=FALSE}
+feature_selector(fraud_train)
+```
+
+## List of interesting features
+```{r}
+sig_new <- c("t_email_fprob", "event_timestamp_wday_fprob", "event_timestamp_day_fprob" , "event_timestamp_month_fprob",
+             "transaction_env_fprob", "signature_image_fprob","locale_fprob", "cvv_fprob", "maj_industry_id_fprob",
+             "transaction_type_fprob","billing_postal_fprob", "billing_city_fprob", "billing_state_fprob", "currency",
+             "billing_state_fprob","email_domain_fprob", "user_agent_browser_fprob" , "card_bin_fprob", "account_age_days",
+             "transaction_amt","transaction_adj_amt")
+
+```
+
+# Model building
+
+## Model evaluation strategy
+
+```{r}
+#function to predict given model and threshold
+predict_set <- function(workflow_fit, dataset, threshold = 0.5){
+  scored <- predict(workflow_fit, dataset, type="prob") %>% 
+    mutate(.pred_class = as.factor(ifelse(.pred_fraud>=threshold, "fraud","legit"))) %>% 
+    bind_cols(.,dataset)
+  return(scored)}
+
+
+#function to evaluate model and compute model gain
+evaluate_set <- function(scored_data, model_name, datasplit = "training", event_label = "churn", event_level="second"){
+  
+  multi_metric <- metric_set(accuracy, precision, recall, mn_log_loss, specificity , roc_auc)
+  scored_data %>% 
+    multi_metric(truth = !!as.name(event_label), 
+            predicted = .pred_fraud, 
+            estimate = .pred_class,
+            event_level = event_level) %>%
+    mutate(datasplit=datasplit,
+           model_name = model_name, 
+           .estimate = round(.estimate, 4)) %>%  
+    pivot_wider(names_from = .metric, values_from=.estimate) %>% 
+    mutate(fpr = 1- specificity) -> eval
+return(eval)}
+```
+
+
+## Receipe
+```{r}
+
+#recipe
+fraud_recipe <- recipe(event_label ~ transaction_env_fprob + signature_image_fprob + 
+                         cvv_fprob + transaction_type_fprob + uid_fprob + currency + 
+                         
+                         account_age_days + transaction_amt + transaction_adj_amt,
+                       data = fraud_train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  themis::step_downsample(event_label, under_ratio = 3)
+
+
+```
+
+
+## Logistic Model
+
+### Model specification
+
+```{r}
+#Model specification
+log_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+#Model workflow
+log_workflow <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(log_spec) %>%
+  fit(fraud_train)
+## -- check out your parameter estimates ...
+metrics <- tidy(log_workflow) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+
+metrics
+```
+
+### Logistic Model - Evaluation
+
+```{r}
+scored_train_log <- predict_set(workflow_fit = log_workflow,dataset = fraud_train,threshold = 0.5)
+scored_train_log
+
+eval_metrics_train_log <- evaluate_set(scored_data = scored_train_log, model_name = "logistic", datasplit = "training",event_label = "event_label",event_level = "first")
+
+scored_test_log <- predict_set(workflow_fit = log_workflow,dataset = fraud_test,threshold = 0.5)
+scored_test_log
+
+eval_metrics_test_log <- evaluate_set(scored_data = scored_test_log, model_name = "logistic", datasplit = "testing",event_label = "event_label",event_level = "first")
+
+eval_metrics_log <- eval_metrics_train_log %>% bind_rows(eval_metrics_test_log)
+eval_metrics_log
+```
+
+
+
+## Random Forest Default
+
+### Model Specification
+
+```{r, eval=FALSE}
+
+#Random forest specification
+set.seed(234)
+rf_spec_default <- rand_forest() %>% 
+  set_mode("classification") %>%
+  set_engine(engine = "ranger",
+             max.depth = 10,
+             importance = "permutation")
+
+rf_def_wf <- workflow() %>% 
+  add_recipe(fraud_recipe) %>% 
+  add_model(rf_spec_default) %>% 
+  fit(fraud_train)
+
+rf_def_wf
+
+
+# saveRDS(rf_def_wf, "./models/rf_default_500trees_10depth_improvement2.rds")
+rf_def_wf %>%
+  extract_fit_parsnip() %>%
+  vip(30)
+```
+
+### Random Forest Default - Evaluation
+
+```{r}
+rf_def_wf <- readRDS("./models/final_rf_wf_tuned_better2.rds")
+scored_train_rf <- predict_set(rf_def_wf, fraud_train)
+scored_test_rf <- predict_set(rf_def_wf, fraud_test)
+
+# write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+# write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf <- evaluate_set(scored_data = scored_train_rf, model_name = "Random forest - default", datasplit = "training",event_label = "event_label",event_level = "first")
+eval_metrics_test_rf <- evaluate_set(scored_data = scored_test_rf, 
+                                     model_name = "Random forest - default", 
+                                     datasplit = "testing",event_label = "event_label",event_level = "first")
+
+eval_metrics_rf_default <- eval_metrics_train_rf %>% bind_rows(eval_metrics_test_rf)
+
+eval_metrics_rf_default
+```
+
+## Random Forest Tuned
+
+### Model specification
+
+```{r}
+set.seed(456)
+rf_tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 500,
+  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation", max.depth = 15)
+
+#workflow
+rf_tune_wf <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(rf_tune_spec)
+
+#vfold samples
+set.seed(234)
+trees_folds <- vfold_cv(fraud_train, v = 3)
+
+#enable parallel processing
+doParallel::registerDoParallel(cores = 3)
+
+#set up grid  
+set.seed(456)
+rf_grid <- grid_random(
+  mtry(range(5,12)),
+  min_n(),
+  size = 10)
+
+rf_grid
+
+#metric set
+tune_metric <- metric_set(roc_auc)
+
+
+#tune
+set.seed(456)
+regular_res <- tune_grid(
+  rf_tune_wf,
+  resamples = trees_folds,
+  grid = rf_grid,
+  metrics = tune_metric
+  
+)
+
+regular_res
+
+#view metrics
+regular_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+
+
+#select best parameters
+best_auc <- select_best(regular_res, "roc_auc")
+
+#select best model
+final_rf <- finalize_model(
+  rf_tune_spec,
+  best_auc
+)
+
+final_rf
+
+#final workflow
+final_rf_wf_tuned <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(final_rf) %>% 
+  fit(fraud_train)
+  
+
+
+# saveRDS(final_rf_wf_tuned, "./models/final_rf_wf_tuned_better2.rds")
+
+#Variable Importance
+final_rf_wf_tuned %>%
+  extract_fit_parsnip() %>%
+  vip(30)
+
+```
+
+
+### Random Forest Tuned - Evaluation
+
+```{r}
+#rf_wf <- readRDS("./rand_forest_final_tune.rds")
+scored_train_rf_tuned <- predict_set(final_rf_wf_tuned, fraud_train)
+scored_test_rf_tuned <- predict_set(final_rf_wf_tuned, fraud_test)
+
+# write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+# write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf_tuned <- evaluate_set(scored_data = scored_train_rf_tuned, model_name = "Random forest - tuned", datasplit = "training",event_label = "event_label",event_level = "first")
+eval_metrics_test_rf_tuned <- evaluate_set(scored_data = scored_test_rf_tuned, model_name = "Random forest - tuned", datasplit = "testing",event_label = "event_label",event_level = "first")
+
+eval_metrics_rf_tune <- eval_metrics_train_rf_tuned %>% bind_rows(eval_metrics_test_rf_tuned)
+eval_metrics_rf_tune
+
+
+```
+
+# Model Results and comparision
+```{r}
+bind_rows(eval_metrics_log, eval_metrics_rf_default, eval_metrics_rf_tune )
+```
+
+Confusion Matrix
+```{r}
+
+scored_test_rf_tuned %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+```
+
+
+
+# Evaluation 
+
+## Current Operating Range
+
+```{r}
+# ROC Curve  
+bind_rows(scored_train_rf_tuned %>% mutate(datasplit = "training"), 
+          scored_test_rf_tuned  %>% mutate(datasplit = "testing")) %>%
+  group_by(datasplit) %>%
+  roc_curve(event_label, .pred_fraud) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.0247, # 5% FPR 
+             color = "red",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.05, # 5% FPR 
+             color = "yellow",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.25,   # 25% FPR 
+             color = "blue",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.75,   # 75% FPR 
+             color = "green",
+             linetype = "longdash") +
+  labs(title = "RF ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+```
+
+
+```{r}
+ #histogram of probability of fraud 
+scored_test_rf_tuned %>%
+  ggplot(aes(.pred_fraud, fill = event_label)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.5, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of FRAUD:", "RF Model") ,
+    x = ".pred_fraud",
+    y = "count",
+    fill = "Event Label"
+  ) 
+```
+
+
+## Operating at 5% False Positive Rate (Threshould = 0.316	)
+
+```{r}
+# operating range 0 - 10% 
+operating_range <- scored_test_rf_tuned %>%
+  roc_curve(event_label, .pred_fraud)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    tpr = round(sensitivity, 3),
+    score_threshold =  round(.threshold, 3)
+  ) %>%
+  group_by(fpr) %>%
+  summarise(threshold = round(mean(score_threshold),3),
+            tpr = mean(tpr)) %>%
+  filter(fpr <= 0.1)
+# operating range table 
+operating_range
+```
+
+## Precision, Recall, and Accuracy at the 5% FPR
+
+```{r}
+scored_train_rf_fpr <- predict_set(final_rf_wf_tuned, fraud_train, threshold =  0.316)
+scored_test_rf_fpr <- predict_set(final_rf_wf_tuned, fraud_test, threshold =  0.316)
+
+eval_metrics_train_rf_fpr <- evaluate_set(scored_data = scored_train_rf_fpr, model_name = "Random forest - tuned", datasplit = "training",event_label = "event_label",event_level = "first")
+eval_metrics_test_rf_fpr <- evaluate_set(scored_data = scored_test_rf_fpr, model_name = "Random forest - tuned", datasplit = "testing",event_label = "event_label",event_level = "first")
+
+bind_rows(eval_metrics_train_rf_fpr,
+         eval_metrics_test_rf_fpr )
+
+
+```
+
+
+```{r}
+# ROC Curve  
+bind_rows(scored_train_rf_fpr %>% mutate(datasplit = "training"), 
+          scored_test_rf_fpr  %>% mutate(datasplit = "testing")) %>%
+  group_by(datasplit) %>%
+  roc_curve(event_label, .pred_fraud) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.0037, # 5% FPR 
+             color = "red",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.05, # 5% FPR 
+             color = "yellow",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.25,   # 25% FPR 
+             color = "blue",
+             linetype = "longdash") +
+  geom_vline(xintercept = 0.75,   # 75% FPR 
+             color = "green",
+             linetype = "longdash") +
+  labs(title = "RF ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+```
+
+
+```{r}
+ #histogram of probability of fraud 
+scored_test_rf_fpr%>%
+  ggplot(aes(.pred_fraud, fill = event_label)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.316, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of FRAUD:", "RF Model") ,
+    x = ".pred_fraud",
+    y = "count"
+  ) 
+```
+
+
+
+### Global importance
+```{r}
+rf_workflow_fit <- rf_def_wf
+rf_workflow_fit %>% 
+  pull_workflow_fit() %>%
+  vip(5)
+
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = fraud_train,
+  y = fraud_train$event_label ,
+  verbose = TRUE
+)
+
+pdp_grade <- model_profile(
+  rf_explainer,
+  variables = c("transaction_adj_amt")
+)
+
+
+plot(pdp_grade) + 
+  labs(title = "PDP Transaction Adjusted Amount", 
+       x="Transaction Adjusted Amount", 
+       y="Fraud") 
+  
+  
+as_tibble(pdp_grade$agr_profiles) %>%
+  mutate(profile_variable = `_x_`,
+         avg_prediction_impact = `_yhat_`) %>%
+  ggplot(aes(x=profile_variable, y=avg_prediction_impact)) +
+  geom_col() +
+  labs(
+    x = "Variable: Transaction Adjusted Amount",
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial dependence plot Transaction Adjusted Amount",
+    subtitle = "How does GRADE impact predictions (on average)"
+  ) 
+
+```
+```{r}
+sig_n <-c("transaction_adj_amt","cvv_fprob")
+plot_pad <- function(i){
+
+pdp_grade <- model_profile(
+  rf_explainer,
+  variables = c(i)
+)
+
+plot(pdp_grade) + 
+  labs(title = paste0("PDP ", i), 
+       y="Fraud", 
+       x=i)  -> xl
+
+return(xl)
+# as_tibble(pdp_grade$agr_profiles) %>%
+#   mutate(profile_variable = `_x_`,
+#          avg_prediction_impact = `_yhat_`) %>%
+#   ggplot(aes(x=profile_variable, y=avg_prediction_impact)) +
+#   geom_col() +
+#   labs(
+#     x = paste0("Variable: ", i),
+#      y = " Average prediction Impact ",
+#     color = NULL,
+#     title = paste0("Partial dependence plot ", i),
+#     subtitle = paste0("How does ", i, "impact predictions (on average)") %>% print()
+#   ) 
+}
+plot_pad("transaction_type_fprob")
+
+```
+
+
+
+
+```{r}
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = fraud_train ,
+  y = fraud_train$event_label ,
+  verbose = TRUE
+)
+
+pdp_age <- model_profile(
+  rf_explainer,
+  variables = "annual_inc"
+)
+
+
+pdp_age <- model_profile(
+  rf_explainer,
+  variables = "annual_inc"
+)
+
+plot(pdp_age)
+  labs(title = "PDP annual_inc", x="annual_inc", y="average impact on prediction") 
+```
+
+
+## Prediction Explainer 
+
+```{r}
+# speed things up! 
+train_sample <- fraud_train %>% 
+  select(event_label,
+         transaction_env_fprob,
+         signature_image_fprob,
+         cvv_fprob,
+         transaction_type_fprob,
+         uid_fprob,
+         currency,
+         account_age_days,
+         transaction_amt,
+         transaction_adj_amt) %>%
+  sample_frac(0.1) # take a 10% sample or less
+
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = train_sample ,
+  y = train_sample$event_level ,
+  verbose = TRUE
+)
+
+# you should use TEST not training for this! 
+scored_test_rf %>% head()
+
+# Top 5 TP highest scoring defaults 
+top_5_tp <- scored_test_rf %>%
+  filter(.pred_class == event_label) %>%
+  filter(event_label == "fraud") %>%
+  slice_max(order_by = .pred_fraud, n=10)
+
+# Top 5 FP highest scoring defaults 
+top_5_fp <- scored_train_rf %>%
+  filter(.pred_class == event_label) %>%
+  filter(event_label != "fraud") %>%
+  slice_max(order_by = .pred_fraud, n=10)
+
+# Bottom 5 FN lowest scoring defaults 
+bottom_5_fn <- scored_train_rf %>%
+  filter(.pred_class == event_label) %>%
+  filter(event_label == "fraud") %>%
+  slice_min(order_by = .pred_fraud, n=10)
+
+
+```
+
+## Local Explainer 
+
+```{r}
+
+explain_prediction_shap <- function(single_record){
+# step 1. run the explainer 
+record_shap <- predict_parts(explainer = rf_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+# step 2. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_fraud"] %>% 
+  mutate(.pred_fraud = round(.pred_fraud,3)) %>% 
+  pull() 
+
+# step 3. plot it. 
+# you notice you don't get categorical values ...  
+record_shap %>% 
+  plot() +
+  labs(title=paste("SHAP Explainer:",prediction_prob),
+       x = "shap importance",
+       y = "record") -> shap_plot 
+
+print(shap_plot)
+}
+
+# example TP 5 records
+for (row in 1:nrow(bottom_5_fn)) {
+    s_record <- bottom_5_fn[row,]
+    explain_prediction_shap(s_record)
+} 
+```
+```{r}
+explain_prediction_breakdown <- function(single_record){
+# step 1. run the explainer 
+record_breakdown <- predict_parts(explainer = rf_explainer, 
+                               new_observation = single_record,
+                               type="break_down")
+
+# step 2. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_fraud"] %>% 
+  mutate(.pred_fraud = round(.pred_fraud,3)) %>% 
+  pull() 
+
+# step 3. plot it. 
+# you notice you don't get categorical values ...  
+record_breakdown %>% 
+  plot() +
+  labs(title=paste("BREAKDOwN Explainer:",prediction_prob),
+       x = "contribution",
+       y = "record") -> breakdown_plot 
+
+print(breakdown_plot)
+}
+# example TP 5 records
+for (row in 1:nrow(bottom_5_fn)) {
+    s_record <- bottom_5_fn[row,]
+    explain_prediction_breakdown(s_record)
+} 
+
+```
+
+
+
+
+
+
+# Kaggle Prediction
+
+```{r}
+predict_set(rf_def_wf, fraud_holdout) %>% 
+  dplyr::select(event_id, event_label = .pred_fraud) %>% 
+  write_csv("./results/kaggle7.csv")
+```
+
+
+
+
