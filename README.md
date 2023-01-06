@@ -1,10 +1,9 @@
 # Credit Card Fraud Prediction
 
-<img src="https://i.imgur.com/pWBEwXX.png" />
+<img src="https://i.imgur.com/5bS5str.png" />
 
 <h2>Problem statement</h2>
 While the current fraud rate at a large financial institution is about 5%, the company has been experiencing an upward trend in credit card fraud. From the available dataset, the fraud rate has increased from 1% in 2020 to 4% in 2021. This trend not only increases the risk of reputational damage but also the possibility of customers losing trust in the company. The situation is bad that it may cause the company to lose existing customers and hamper its ability to attract new customers. The company needs to take drastic actions now to reverse the trend.
-
 <br></br>
 In this project, I attempt to use machine learning to help a large financial institution actively flag fraud at the 5% false positive rate.
 
@@ -41,11 +40,11 @@ In effect, introducing this second layer of transaction approval (which may be a
 2. Clone the project: Run this from the command line
  
  ```commandline
- git clone https://github.com/graphshade/loan_default.git
+ git clone https://github.com/graphshade/credit_card_fraud.git
  ```
  
 3. Install Required Libraries Using Virtual Environment: 
    
    You may install the libraries directly on your computer however, using the virtual environment library `renv`. [Follow this guide to install renv](https://www.youtube.com/watch?v=yc7ZB4F_dc0)
    1. Open the app.R file in RStudio
-   2. In the RStudio console run `renv::init()` to initiate the renv virtual environment and install the required libraries from the [renv.lock](https://github.com/graphshade/loan_default/blob/main/renv.lock) file 
+   2. In the RStudio console run `renv::init()` to initiate the renv virtual environment and install the required libraries from the [renv.lock](https://github.com/graphshade/credit_card_fraud/blob/main/renv.lock) file 
